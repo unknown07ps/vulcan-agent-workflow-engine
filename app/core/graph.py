@@ -29,6 +29,19 @@ from app.core.state import WorkflowState
 logger = logging.getLogger(__name__)
 
 
+def route_if_error(next_node: str):
+    """Build a router that goes to `finalize` if state['error'] is set,
+    otherwise continues to `next_node`. Used after planner/researcher/formatter
+    so an LLM failure short-circuits the rest of the pipeline."""
+
+    def _router(state: WorkflowState) -> str:
+        if state.get("error"):
+            return "finalize"
+        return next_node
+
+    return _router
+
+
 def route_after_critic(state: WorkflowState) -> Literal["revise", "end"]:
     """Decide whether to loop back for another revision or finish.
 
@@ -60,7 +73,9 @@ def route_after_critic(state: WorkflowState) -> Literal["revise", "end"]:
 def finalize(state: WorkflowState) -> WorkflowState:
     """Terminal node: copy the latest draft into final_report if not already set."""
     if state.get("error"):
-        return {}
+        # Returning {} is invalid for LangGraph node updates; echo back the
+        # existing error so the graph can complete without writing new state.
+        return {"error": state["error"]}
 
     final_report = state.get("draft")
     return {"final_report": final_report}
@@ -89,9 +104,21 @@ def build_graph():
 
     graph.set_entry_point("planner")
 
-    graph.add_edge("planner", "researcher")
-    graph.add_edge("researcher", "formatter")
-    graph.add_edge("formatter", "critic")
+    graph.add_conditional_edges(
+        "planner",
+        route_if_error("researcher"),
+        {"researcher": "researcher", "finalize": "finalize"},
+    )
+    graph.add_conditional_edges(
+        "researcher",
+        route_if_error("formatter"),
+        {"formatter": "formatter", "finalize": "finalize"},
+    )
+    graph.add_conditional_edges(
+        "formatter",
+        route_if_error("critic"),
+        {"critic": "critic", "finalize": "finalize"},
+    )
 
     graph.add_conditional_edges(
         "critic",
